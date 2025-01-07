@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 
 const websocketUrl =
   "wss://6075izj98j.execute-api.us-east-2.amazonaws.com/dev/"; // AWS WebSocket URL
@@ -7,8 +7,12 @@ function App() {
   const [isConnected, setIsConnected] = useState(false); // WebSocket connection status
   const [isRecording, setIsRecording] = useState(false); // Recording status
   const [transcription, setTranscription] = useState(""); // Transcription text
+  const [audioPreviews, setAudioPreviews] = useState([]); // Array of audio preview URLs
+
   const socketRef = useRef(null);
   const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const intervalIdRef = useRef(null);
 
   const connectWebSocket = () => {
     if (!isConnected) {
@@ -21,7 +25,6 @@ function App() {
 
       socketRef.current.onclose = (event) => {
         console.log("WebSocket disconnected");
-        console.log(event);
         setIsConnected(false);
         if (event.code !== 1000) {
           console.log("Unexpected disconnection. Reconnecting in 3 seconds...");
@@ -41,7 +44,6 @@ function App() {
         const data = JSON.parse(event.data);
         console.log("Message received from backend:", data);
         setTranscription((prev) => prev + "\n" + data.transcription);
-        console.log("minhdz", data);
       };
     }
   };
@@ -54,6 +56,49 @@ function App() {
     }
   };
 
+  const startMediaRecorder = () => {
+    const mimeType = "audio/webm;codecs=opus";
+
+    const mediaRecorder = new MediaRecorder(streamRef.current, {
+      mimeType,
+      audioBitsPerSecond: 16000,
+    });
+
+    mediaRecorderRef.current = mediaRecorder;
+
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        const audioURL = URL.createObjectURL(event.data);
+        setAudioPreviews((prev) => [...prev, audioURL]);
+
+        console.log("Audio chunk available. Preview added:", audioURL);
+
+        // Send audio chunk via WebSocket
+        if (
+          socketRef.current &&
+          socketRef.current.readyState === WebSocket.OPEN
+        ) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const base64 = reader.result.split(",")[1];
+            const message = JSON.stringify({ data: base64 });
+            socketRef.current.send(message);
+          };
+          reader.readAsDataURL(event.data); // Convert blob to Base64
+        } else {
+          console.error("WebSocket is not open. Cannot send data.");
+        }
+      }
+    };
+
+    mediaRecorder.onstop = () => {
+      console.log("MediaRecorder stopped. Preparing for next instance.");
+    };
+
+    mediaRecorder.start();
+    console.log("MediaRecorder started");
+  };
+
   const startRecording = async () => {
     if (!isConnected) {
       alert("Please connect to WebSocket first!");
@@ -62,52 +107,18 @@ function App() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
+      streamRef.current = stream; // Keep the stream for re-use
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (
-          socketRef.current &&
-          socketRef.current.readyState === WebSocket.OPEN &&
-          event.data.size > 0
-        ) {
-          console.log("Sending audio chunk to backend...");
-          const reader = new FileReader();
+      startMediaRecorder(); // Start the first MediaRecorder instance
 
-          reader.onload = () => {
-            const base64 = reader.result.split(",")[1];
-            socketRef.current.send(base64);
-            console.log("Sending base 64: ", base64);
-          };
-
-          reader.readAsDataURL(event.data); // convert blob to Base64
-
-          // console.log("Sending raw Blob to backend...");
-          // console.log("Blob type:", event.data.type);
-          // console.log("Blob size:", event.data.size);
-          // socketRef.current.send(event.data);
-
-          // const reader = new FileReader();
-
-          // reader.onload = () => {
-          //   const arrayBuffer = reader.result;
-          //   console.log(
-          //     "Sending ArrayBuffer to backend. Size:",
-          //     arrayBuffer.byteLength
-          //   );
-          //   socketRef.current.send(arrayBuffer);
-          // };
-          // reader.readAsArrayBuffer(event.data);
-          // socketRef.current.send(event.data); // Send audio chunk
-          // console.log(isConnected);
-        } else {
-          console.error("WebSocket is not open. Cannot send data.");
+      intervalIdRef.current = setInterval(() => {
+        if (mediaRecorderRef.current) {
+          mediaRecorderRef.current.stop(); // Stop the current MediaRecorder
+          startMediaRecorder(); // Start a new instance
         }
-      };
+      }, 6000); // Switch every 6 seconds
 
-      mediaRecorder.start(250); // Start recording
       setIsRecording(true);
-      console.log("Recording started");
     } catch (error) {
       if (error.name === "NotAllowedError") {
         alert("Microphone access is required to start recording.");
@@ -120,14 +131,27 @@ function App() {
   const stopRecording = () => {
     if (mediaRecorderRef.current) {
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      console.log("Recording stopped");
     }
+    if (intervalIdRef.current) {
+      clearInterval(intervalIdRef.current);
+    }
+    if (streamRef.current) {
+      const tracks = streamRef.current.getTracks();
+      tracks.forEach((track) => track.stop());
+    }
+    setIsRecording(false);
+    console.log("Recording stopped");
   };
+
+  useEffect(() => {
+    return () => {
+      stopRecording(); // Cleanup on component unmount
+    };
+  }, []);
 
   return (
     <div style={{ textAlign: "center", marginTop: "50px" }}>
-      <h1>Audio Streaming and Transcription</h1>
+      <h1>Audio Recording with Periodic Restarts</h1>
 
       {/* WebSocket Connection Button */}
       <button
@@ -161,6 +185,20 @@ function App() {
       >
         {isRecording ? "Stop Recording" : "Start Recording"}
       </button>
+
+      {/* Audio Previews */}
+      <div style={{ marginTop: "20px" }}>
+        <h2>Audio Previews</h2>
+        {audioPreviews.length > 0 ? (
+          audioPreviews.map((audioURL, index) => (
+            <div key={index} style={{ margin: "10px 0" }}>
+              <audio controls src={audioURL}></audio>
+            </div>
+          ))
+        ) : (
+          <p>No audio previews available yet.</p>
+        )}
+      </div>
 
       {/* Transcription Display */}
       <div
